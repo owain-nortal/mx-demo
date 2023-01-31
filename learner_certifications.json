@@ -1,0 +1,60 @@
+[
+    {
+      "name": "workerid",
+      "type": "NUMBER",
+      "primary": true,
+      "optional": false,
+      "data_type": {
+        "meta": {},
+        "type": "INTEGER"
+      }
+    },
+    {
+      "name": "identityno",
+      "type": "STRING",
+      "primary": false,
+      "optional": true,
+      "data_type": {
+        "meta": {
+          "length": "45"
+        },
+        "type": "VARCHAR"
+      }
+    },
+    {
+      "name": "firstname",
+      "type": "STRING",
+      "primary": false,
+      "optional": true,
+      "data_type": {
+        "meta": {
+          "length": "100"
+        },
+        "type": "VARCHAR"
+      }
+    },
+    {
+      "name": "lastname",
+      "type": "STRING",
+      "primary": false,
+      "optional": true,
+      "data_type": {
+        "meta": {
+          "length": "100"
+        },
+        "type": "VARCHAR"
+      }
+    },
+    {
+      "name": "qualifications",
+      "type": "STRING",
+      "primary": false,
+      "optional": true,
+      "data_type": {
+        "meta": {
+            "length": "16000"         
+        },
+        "type": "VARCHAR"
+      }
+    }
+]

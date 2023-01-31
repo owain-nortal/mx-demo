@@ -1,0 +1,171 @@
+[config]
+  docker_tag=v0.1.76
+  executor_memory=1024m
+  driver_memory=1024m
+---
+from core_data.utils.spark.common import \
+     get_spark_session_context_with_listeners
+from core_data.utils.spark.datahub import set_datahub_config_in_spark_conf
+from core_data.utils.spark.jdbc import JDBCConnectionConfiguration, \
+     get_dataframe_from_table, save_dataframe_to_jdbc, check_trino_table_exists
+from core_data.utils.spark.trino import register_trino_jdbc_dialect, \
+     create_trino_options
+from pyspark import SparkConf
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+from core_data.data_quality.run_suite import \
+     run_auto_data_quality_with_datahub_action
+from core_data.utils.config import datahub_config, TrinoConfig, \
+     TrinoCatalogSchemaConfig, DataQualityConfig
+import os
+
+# Convert JSON array to String type
+arrayToStringUDF = F.udf(lambda x: x, StringType())
+
+data_product_name = os.getenv("DATA_PRODUCT_NAME", "learner_certifications")
+target_table_name = os.getenv("TARGET_TABLE_NAME", "learner_certifications")
+
+data_quality_config = DataQualityConfig.from_env()
+
+# Initialize Spark session
+spark_conf = set_datahub_config_in_spark_conf(SparkConf(), datahub_config)
+spark, _ = (
+    get_spark_session_context_with_listeners(
+        app_name=f"{data_product_name} Data Product",
+        spark_conf=spark_conf,
+    )
+)
+
+# Register Trino JDBC Dialect
+register_trino_jdbc_dialect(spark)
+
+# Trino information
+trino_config = TrinoConfig.from_env()
+trino_catalog_schema_config = TrinoCatalogSchemaConfig.from_env()
+
+# Trino credentials
+trino_options = create_trino_options(
+    trino_config, trino_catalog_schema_config.catalog,
+)
+
+# Check if Trino table exists, if not raise exception
+check_trino_table_exists(spark, trino_catalog_schema_config, target_table_name, trino_options)
+
+# Smart Construction
+sc_host = os.getenv("SC_HOST", "external-mysql.sc-mysql.svc.cluster.local")
+sc_user = os.getenv("SC_USERNAME", "sc")
+sc_password = os.environ["SC_PASSWORD"]
+sc_url = f"jdbc:mysql://{sc_host}:3306/smartconstruction"
+
+source_db_connection = JDBCConnectionConfiguration(
+    jdbc_url=sc_url,
+    username=sc_user,
+    password=sc_password,
+)
+
+wpdf = get_dataframe_from_table(
+    spark, source_db_connection.create_spark_options(), "worker_profile", None,
+)
+epdf = get_dataframe_from_table(
+    spark, source_db_connection.create_spark_options(), "elc_profile", None,
+)
+eqdf = get_dataframe_from_table(
+    spark, source_db_connection.create_spark_options(), "elcp_qualification", None,
+)
+etdf = get_dataframe_from_table(
+    spark, source_db_connection.create_spark_options(), "elcp_type", None,
+)
+odf = get_dataframe_from_table(
+    spark, source_db_connection.create_spark_options(), "occupation", None,
+)
+
+subset_wp_df = wpdf.select(
+    "worker_profile_id", "worker_identification_number", "first_name",
+    "last_name",
+)
+elc_prof_df = subset_wp_df.join(
+    epdf, subset_wp_df["worker_profile_id"] == epdf[
+        "worker_profile_worker_profile_id"],
+)
+
+intermediate_result_df = (
+    elc_prof_df.join(
+        eqdf, elc_prof_df["elcp_qualification_elcp_qualification_id"] == eqdf[
+            "elcp_qualification_id"],
+        "left_outer",
+    )
+    .withColumnRenamed("name", "elcp_qualification_name")
+    .join(
+        etdf, elc_prof_df["elcp_type_elcp_type_id"] == etdf["elcp_type_id"],
+        "left_outer",
+    )
+    .withColumnRenamed("name", "elcp_qualification_type")
+    .join(
+        odf, elc_prof_df["occupation_occupation_id"] == odf["occupation_id"],
+        "left_outer",
+    )
+    .withColumnRenamed("elcp_qualification_name", "Qualification")
+    .withColumnRenamed("elcp_qualification_type", "QualificationType")
+    .withColumnRenamed("qualification_certification_name", "Certification")
+    .withColumnRenamed("training_provider", "TrainingProvider")
+    .withColumnRenamed("date_received", "CertificationAcceptance")
+    .withColumnRenamed("expiry_date", "CertificationExpiry")
+    .withColumnRenamed("occupation", "Occupation")
+)
+print("Intermediate result DF")
+intermediate_result_df.printSchema()
+
+final_result_df = (
+    intermediate_result_df
+    .withColumn(
+        "Qualifications", F.to_json(
+            F.struct(
+                "Qualification", "QualificationType", "Certification",
+                "TrainingProvider", "CertificationAcceptance",
+                "CertificationExpiry", "Occupation",
+            ), options={"ignoreNullFields": "false"},
+        ),
+    )
+    .groupby(
+        "worker_profile_id", "worker_identification_number", "first_name",
+        "last_name",
+    )
+    .agg(F.collect_list("Qualifications").alias("Qualifications"))
+    .withColumnRenamed("worker_profile_id", "WorkerID")
+    .withColumnRenamed("worker_identification_number", "IdentityNo")
+    .withColumnRenamed("first_name", "FirstName")
+    .withColumnRenamed("last_name", "LastName")
+)
+print("Result dataframe")
+# Transform array field to string
+final_result_df = final_result_df.withColumn(
+    "Qualifications", arrayToStringUDF(
+        F.col("Qualifications"),
+    ),
+)
+final_columns = [
+    "WorkerID", "IdentityNo", "FirstName", "LastName", "Qualifications",
+]
+final_result_df = final_result_df.select(*final_columns)
+final_result_df.printSchema()
+
+# Write dataframe to NEOS storage using Trino
+save_dataframe_to_jdbc(
+    final_result_df,
+    trino_catalog_schema_config.schema,
+    target_table_name,
+    trino_options,
+)
+
+if data_quality_config.enable_data_quality:
+    # Run data quality and populate DQ tables
+    run_auto_data_quality_with_datahub_action(
+        trino_config=trino_config,
+        trino_catalog_schema_config=trino_catalog_schema_config,
+        target_table_name=target_table_name,
+        spark_session=spark,
+        spark_df=final_result_df,
+    )
+    print("Data quality tables populated")
+
+spark.stop()
